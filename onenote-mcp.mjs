@@ -234,7 +234,8 @@ async function fetchPageContentAdvanced(pageId, method = 'httpDirect') {
  */
 function formatPageInfo(page, index = null) {
   const prefix = index !== null ? `${index + 1}. ` : '';
-  return `${prefix}**${page.title}**
+  const name = page.displayName || page.title; // Use displayName for notebooks, title for pages
+  return `${prefix}**${name}**
    ID: ${page.id}
    Created: ${new Date(page.createdDateTime).toLocaleDateString()}
    Modified: ${new Date(page.lastModifiedDateTime).toLocaleDateString()}`;
