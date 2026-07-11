@@ -15,10 +15,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const tokenFilePath = path.join(__dirname, '.access-token.txt');
 const clientId = process.env.AZURE_CLIENT_ID || '14d82eec-204b-4c2f-b7e8-296a70dab67e'; // Default: Microsoft Graph Explorer App ID
+const tenantId = process.env.AZURE_TENANT_ID || 'common';
 const scopes = ['Notes.Read', 'Notes.ReadWrite', 'Notes.Create', 'User.Read'];
+const targetSectionId = process.env.ONENOTE_TEST_SECTION_ID || '';
+const imageRoot = path.resolve(process.env.ONENOTE_IMAGE_ROOT || path.join(__dirname, '..'));
 
 // --- Global State ---
 let accessToken = null;
+let refreshToken = null;
+let expiresOn = null;
 let graphClient = null;
 
 // --- MCP Server Initialization ---
@@ -38,10 +43,12 @@ const server = new McpServer({
 function loadExistingToken() {
   try {
     if (fs.existsSync(tokenFilePath)) {
-      const tokenData = fs.readFileSync(tokenFilePath, 'utf8');
+      const tokenData = fs.readFileSync(tokenFilePath, 'utf8').replace(/^\uFEFF/, '');
       try {
         const parsedToken = JSON.parse(tokenData); // New format: JSON object
         accessToken = parsedToken.token;
+        refreshToken = parsedToken.refreshToken || null;
+        expiresOn = parsedToken.expiresOn ? Date.parse(parsedToken.expiresOn) : null;
         console.error('Loaded existing token from file (JSON format).');
       } catch (parseError) {
         accessToken = tokenData; // Old format: plain token string
@@ -82,10 +89,65 @@ async function ensureGraphClient() {
   if (!accessToken) {
     throw new Error('No access token available. Please authenticate first using the "authenticate" tool.');
   }
+  await refreshAccessTokenIfNeeded();
   if (!graphClient) {
     initializeGraphClient();
   }
   return graphClient;
+}
+
+async function refreshAccessTokenIfNeeded() {
+  if (!refreshToken || !expiresOn || Date.now() < expiresOn - 5 * 60 * 1000) return;
+  const response = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: clientId,
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      scope: scopes.join(' ')
+    })
+  });
+  if (!response.ok) throw new Error(`Token refresh failed: ${response.status} ${await response.text()}`);
+  const tokenResponse = await response.json();
+  accessToken = tokenResponse.access_token;
+  refreshToken = tokenResponse.refresh_token || refreshToken;
+  expiresOn = Date.now() + Number(tokenResponse.expires_in) * 1000;
+  fs.writeFileSync(tokenFilePath, JSON.stringify({
+    token: accessToken,
+    refreshToken,
+    clientId,
+    scopes,
+    createdAt: new Date().toISOString(),
+    expiresOn: new Date(expiresOn).toISOString()
+  }, null, 2), { mode: 0o600 });
+  graphClient = null;
+  console.error('Microsoft access token refreshed successfully.');
+}
+
+function requireTargetSection() {
+  if (!targetSectionId) {
+    throw new Error('Write access is locked. Set ONENOTE_TEST_SECTION_ID to the section ID inside the separate test notebook.');
+  }
+  return targetSectionId;
+}
+
+function escapeHtmlAttribute(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+async function ensurePageIsInTargetSection(pageId) {
+  requireTargetSection();
+  await ensureGraphClient();
+  const page = await graphClient.api(`/me/onenote/pages/${pageId}?$expand=parentSection`).get();
+  if (!page.parentSection || page.parentSection.id !== targetSectionId) {
+    throw new Error('Write blocked: the page is not in the configured OneNote test section.');
+  }
+  return page;
 }
 
 // ============================================================================
@@ -258,6 +320,7 @@ server.tool(
       let deviceCodeInfo = null;
       const credential = new DeviceCodeCredential({
         clientId: clientId,
+        tenantId: tenantId,
         userPromptCallback: (info) => {
           deviceCodeInfo = info;
           console.error(`\n=== AUTHENTICATION REQUIRED ===\n${info.message}\n================================\n`);
@@ -358,6 +421,23 @@ server.tool(
       }
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: error.message.includes('authenticate') ? '🔐 Authentication Required. Run `authenticate` tool.' : `Failed to list notebooks: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'listSections',
+  {
+    notebookId: z.string().describe('The notebook ID whose sections should be listed.')
+  },
+  async ({ notebookId }) => {
+    try {
+      await ensureGraphClient();
+      const response = await graphClient.api(`/me/onenote/notebooks/${notebookId}/sections`).get();
+      const sections = response.value || [];
+      return { content: [{ type: 'text', text: sections.map((section, i) => `${i + 1}. ${section.displayName}\n   ID: ${section.id}`).join('\n\n') || 'No sections found.' }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text', text: `Failed to list sections: ${error.message}` }] };
     }
   }
 );
@@ -473,6 +553,7 @@ server.tool(
   },
   async ({ pageId, content: newContent, preserveTitle }) => {
     try {
+      await ensurePageIsInTargetSection(pageId);
       await ensureGraphClient();
       const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
       console.error(`Updating content for page: "${pageInfo.title}" (ID: ${pageId})`);
@@ -513,6 +594,7 @@ server.tool(
   },
   async ({ pageId, content: newContent, addTimestamp, addSeparator }) => {
     try {
+      await ensurePageIsInTargetSection(pageId);
       await ensureGraphClient();
       const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
       console.error(`Appending content to page: "${pageInfo.title}" (ID: ${pageId})`);
@@ -547,6 +629,7 @@ server.tool(
   },
   async ({ pageId, newTitle }) => {
     try {
+      await ensurePageIsInTargetSection(pageId);
       await ensureGraphClient();
       const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
       const oldTitle = pageInfo.title;
@@ -578,6 +661,7 @@ server.tool(
   },
   async ({ pageId, findText, replaceText, caseSensitive }) => {
     try {
+      await ensurePageIsInTargetSection(pageId);
       await ensureGraphClient();
       const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
       const htmlContent = await fetchPageContentAdvanced(pageId, 'httpDirect');
@@ -624,6 +708,7 @@ server.tool(
   },
   async ({ pageId, note, noteType, position }) => {
     try {
+      await ensurePageIsInTargetSection(pageId);
       await ensureGraphClient();
       const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
       console.error(`Adding ${noteType} to page: "${pageInfo.title}" (ID: ${pageId}) at ${position}`);
@@ -666,6 +751,7 @@ server.tool(
   },
   async ({ pageId, tableData, title, position }) => {
     try {
+      await ensurePageIsInTargetSection(pageId);
       await ensureGraphClient();
       const pageInfo = await graphClient.api(`/me/onenote/pages/${pageId}`).get();
       console.error(`Adding table to page: "${pageInfo.title}" (ID: ${pageId}) at ${position}`);
@@ -695,6 +781,85 @@ server.tool(
   }
 );
 
+server.tool(
+  'addImageFromUrl',
+  {
+    pageId: z.string().describe('The target OneNote page ID.'),
+    imageUrl: z.string().url().describe('A publicly accessible HTTPS image URL.'),
+    altText: z.string().default('Lesson image').optional(),
+    width: z.number().int().min(50).max(1200).default(600).optional(),
+    position: z.enum(['top', 'bottom']).default('bottom').optional()
+  },
+  async ({ pageId, imageUrl, altText, width, position }) => {
+    try {
+      if (!imageUrl.startsWith('https://')) throw new Error('Only HTTPS image URLs are allowed.');
+      const pageInfo = await ensurePageIsInTargetSection(pageId);
+      const action = position === 'top' ? 'prepend' : 'append';
+      const imageHtml = `<p><img src="${escapeHtmlAttribute(imageUrl)}" alt="${escapeHtmlAttribute(altText)}" width="${width}" /></p>`;
+      const response = await fetch(`https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify([{ target: 'body', action, content: imageHtml }])
+      });
+      if (!response.ok) throw new Error(`Image URL insert failed: ${response.status} ${await response.text()}`);
+      return { content: [{ type: 'text', text: `Image added to "${pageInfo.title}" from the public HTTPS URL.` }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text', text: `Failed to add image URL: ${error.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'addImageFromFile',
+  {
+    pageId: z.string().describe('The target OneNote page ID.'),
+    imagePath: z.string().describe('Absolute path to a local PNG, JPEG, GIF, BMP, or TIFF file inside the allowed image root.'),
+    altText: z.string().default('Lesson image').optional(),
+    width: z.number().int().min(50).max(1200).default(600).optional(),
+    position: z.enum(['top', 'bottom']).default('bottom').optional()
+  },
+  async ({ pageId, imagePath, altText, width, position }) => {
+    try {
+      const pageInfo = await ensurePageIsInTargetSection(pageId);
+      const resolvedPath = path.resolve(imagePath);
+      if (resolvedPath !== imageRoot && !resolvedPath.startsWith(`${imageRoot}${path.sep}`)) {
+        throw new Error(`Image path must be inside the allowed root: ${imageRoot}`);
+      }
+      const mimeTypes = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.bmp': 'image/bmp', '.tif': 'image/tiff', '.tiff': 'image/tiff'
+      };
+      const mimeType = mimeTypes[path.extname(resolvedPath).toLowerCase()];
+      if (!mimeType) throw new Error('Unsupported image type. Use PNG, JPEG, GIF, BMP, or TIFF.');
+      const fileStat = fs.statSync(resolvedPath);
+      if (!fileStat.isFile()) throw new Error('Image path is not a file.');
+      if (fileStat.size > 4 * 1024 * 1024) throw new Error('Image exceeds the 4 MB Microsoft Graph request limit.');
+      const imageBytes = fs.readFileSync(resolvedPath);
+      const boundary = `OneNoteImageBoundary${Date.now()}`;
+      const action = position === 'top' ? 'prepend' : 'append';
+      const commands = JSON.stringify([{
+        target: 'body', action,
+        content: `<p><img src="name:image-part" alt="${escapeHtmlAttribute(altText)}" width="${width}" /></p>`
+      }]);
+      const multipartBody = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="Commands"\r\nContent-Type: application/json\r\n\r\n${commands}\r\n`),
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="image-part"; filename="${escapeHtmlAttribute(path.basename(resolvedPath))}"\r\nContent-Type: ${mimeType}\r\n\r\n`),
+        imageBytes,
+        Buffer.from(`\r\n--${boundary}--\r\n`)
+      ]);
+      const response = await fetch(`https://graph.microsoft.com/v1.0/me/onenote/pages/${pageId}/content`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+        body: multipartBody
+      });
+      if (!response.ok) throw new Error(`Local image insert failed: ${response.status} ${await response.text()}`);
+      return { content: [{ type: 'text', text: `Local image "${path.basename(resolvedPath)}" added to "${pageInfo.title}".` }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: 'text', text: `Failed to add local image: ${error.message}` }] };
+    }
+  }
+);
+
 // --- Page Creation Tool ---
 server.tool(
   'createPage',
@@ -706,13 +871,9 @@ server.tool(
     try {
       await ensureGraphClient();
       console.error(`Attempting to create page with title: "${title}"`);
-      
-      const sectionsResponse = await graphClient.api('/me/onenote/sections').get();
-      if (!sectionsResponse.value || sectionsResponse.value.length === 0) {
-        throw new Error('No sections found in your OneNote. Cannot create a page.');
-      }
-      const targetSectionId = sectionsResponse.value[0].id;
-      const targetSectionName = sectionsResponse.value[0].displayName;
+      requireTargetSection();
+      const targetSection = await graphClient.api(`/me/onenote/sections/${targetSectionId}`).get();
+      const targetSectionName = targetSection.displayName;
       
       const htmlContent = textToHtml(content);
       const pageHtml = `<!DOCTYPE html>

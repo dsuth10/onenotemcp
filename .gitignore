@@ -8,6 +8,7 @@ package-lock.json
 # Project-specific files
 # CRITICAL: Contains sensitive authentication token
 .access-token.txt
+.device-auth.json
 *.log
 
 # Environment variables
