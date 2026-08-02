@@ -14,7 +14,7 @@ import { z } from "zod";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const tokenFilePath = path.join(__dirname, '.access-token.txt');
-const clientId = process.env.AZURE_CLIENT_ID || '14d82eec-204b-4c2f-b7e8-296a70dab67e'; // Default: Microsoft Graph Explorer App ID
+const clientId = process.env.AZURE_CLIENT_ID || '0c3301de-9e6b-4dd4-bf4d-46ab2ac4f3d8';
 const tenantId = process.env.AZURE_TENANT_ID || 'common';
 const scopes = ['Notes.Read', 'Notes.ReadWrite', 'Notes.Create', 'User.Read'];
 const targetSectionId = process.env.ONENOTE_TEST_SECTION_ID || '';
@@ -98,31 +98,44 @@ async function ensureGraphClient() {
 
 async function refreshAccessTokenIfNeeded() {
   if (!refreshToken || !expiresOn || Date.now() < expiresOn - 5 * 60 * 1000) return;
-  const response = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: clientId,
-      grant_type: 'refresh_token',
-      refresh_token: refreshToken,
-      scope: scopes.join(' ')
-    })
-  });
-  if (!response.ok) throw new Error(`Token refresh failed: ${response.status} ${await response.text()}`);
-  const tokenResponse = await response.json();
-  accessToken = tokenResponse.access_token;
-  refreshToken = tokenResponse.refresh_token || refreshToken;
-  expiresOn = Date.now() + Number(tokenResponse.expires_in) * 1000;
-  fs.writeFileSync(tokenFilePath, JSON.stringify({
-    token: accessToken,
-    refreshToken,
-    clientId,
-    scopes,
-    createdAt: new Date().toISOString(),
-    expiresOn: new Date(expiresOn).toISOString()
-  }, null, 2), { mode: 0o600 });
-  graphClient = null;
-  console.error('Microsoft access token refreshed successfully.');
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const response = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        scope: scopes.join(' ')
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) throw new Error(`Token refresh failed: ${response.status} ${await response.text()}`);
+    const tokenResponse = await response.json();
+    accessToken = tokenResponse.access_token;
+    refreshToken = tokenResponse.refresh_token || refreshToken;
+    expiresOn = Date.now() + Number(tokenResponse.expires_in) * 1000;
+    fs.writeFileSync(tokenFilePath, JSON.stringify({
+      token: accessToken,
+      refreshToken,
+      clientId,
+      scopes,
+      createdAt: new Date().toISOString(),
+      expiresOn: new Date(expiresOn).toISOString()
+    }, null, 2), { mode: 0o600 });
+    graphClient = null;
+    console.error('Microsoft access token refreshed successfully.');
+  } catch (err) {
+    console.error(`Failed to refresh access token: ${err.message}. Clearing expired credentials.`);
+    accessToken = null;
+    refreshToken = null;
+    expiresOn = null;
+    graphClient = null;
+    throw new Error('Access token expired and token refresh failed. Please authenticate using the "authenticate" tool.');
+  }
 }
 
 function requireTargetSection() {
@@ -300,8 +313,7 @@ function formatPageInfo(page, index = null) {
   return `${prefix}**${name}**
    ID: ${page.id}
    Created: ${new Date(page.createdDateTime).toLocaleDateString()}
-   Modified: ${new Date(page.lastModifiedDateTime).toLocaleDateString()}`;
-}
+   Modified: ${new Date(page.lastModifiedDateTime).toLocaleDateString()}`;}
 
 // ============================================================================
 // MCP TOOL DEFINITIONS
@@ -311,9 +323,7 @@ function formatPageInfo(page, index = null) {
 
 server.tool(
   'authenticate',
-  {
-    // No input parameters expected for this tool
-  },
+  {},
   async () => {
     try {
       console.error('Starting device code authentication...');
@@ -328,7 +338,10 @@ server.tool(
       });
 
       const authPromise = credential.getToken(scopes);
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Allow time for userPromptCallback
+      for (let i = 0; i < 30; i++) {
+        if (deviceCodeInfo) break;
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
 
       if (deviceCodeInfo) {
         const authMessage = `🔐 **AUTHENTICATION REQUIRED**
@@ -356,7 +369,7 @@ Token will be saved automatically upon successful browser authentication.`;
         }).catch(error => {
           console.error(`Background authentication failed: ${error.message}`);
         });
-        
+
         return { content: [{ type: 'text', text: authMessage }] };
       } else {
         return { isError: true, content: [{ type: 'text', text: 'Could not retrieve device code information. Please try again or check console logs.' }] };
@@ -366,10 +379,6 @@ Token will be saved automatically upon successful browser authentication.`;
     }
   }
 );
-// Note: For the above tool, the Zod schema `z.object({}).describe(...)` was simplified to `{}` as per the user's specific finding
-// about the SDK's `server.tool(name, {param: z.type()}, handler)` signature.
-// If the SDK *does* support a top-level describe on the Zod object itself, that would be:
-// `z.object({}).describe('Start the authentication flow...')`
 
 server.tool(
   'saveAccessToken',
